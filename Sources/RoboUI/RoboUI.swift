@@ -22,3 +22,5 @@ public typealias Connection = RosbridgeConnection
 // - LaserScanView: LiDAR point cloud visualization
 // - CameraView: compressed image / video feed
 // - CameraHUD: recording indicator + format overlay
+// - EmergencyStopButton: one-tap safety stop with haptics
+// - TelemetryView: battery, speed, custom sensors panel
