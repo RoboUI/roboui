@@ -88,6 +88,12 @@ public struct LaserScanView: View {
         guard let scan else { return }
         let points = scan.points
         
+        // Fade-out zone: points beyond fadeStart fade to 0 opacity at fadeEnd.
+        // Close walls are crisp, far walls (which distort) smoothly disappear.
+        let fadeStart: CGFloat = maxRange * 0.5   // start fading at 50% of max range
+        let fadeEnd: CGFloat = maxRange * 0.85    // fully hidden at 85% of max range
+        let fadeRange = fadeEnd - fadeStart
+        
         for point in points {
             let heading = CGFloat(robotHeading)
             let px = CGFloat(point.x)
@@ -99,7 +105,18 @@ public struct LaserScanView: View {
             let screenY = center.y - ry * scale
             
             let dist = hypot(px, py)
-            let intensity = 1.0 - min(dist / maxRange, 1.0) * 0.6
+            
+            // Distance-based fade: close=bright, far=hidden
+            let fadeAlpha: CGFloat
+            if dist < fadeStart {
+                fadeAlpha = 1.0
+            } else if dist > fadeEnd {
+                continue  // skip — fully faded, don't draw
+            } else {
+                fadeAlpha = 1.0 - (dist - fadeStart) / fadeRange
+            }
+            
+            let intensity = (1.0 - min(dist / maxRange, 1.0) * 0.6) * fadeAlpha
             
             var dot = Path()
             dot.addEllipse(in: CGRect(

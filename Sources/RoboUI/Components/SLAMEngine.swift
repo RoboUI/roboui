@@ -1,34 +1,48 @@
 // RoboUI — SLAMEngine
-// Pure Swift port of BreezySLAM (CoreSLAM / tinySLAM).
-// Implements RMHC (Random-Mutation Hill-Climbing) SLAM for real-time
-// 2D LiDAR-based mapping and localization on iOS/macOS.
+// Pure Swift SLAM engine using RMHC (Random-Mutation Hill-Climbing) search
+// with log-odds occupancy grid and distance-weighted inverse sensor model.
 //
-// Ported from BreezySLAM C core by Simon D. Levy (LGPL v3).
-// Original: https://github.com/simondlevy/BreezySLAM
+// Based on BreezySLAM/CoreSLAM concepts, but with proper probabilistic
+// map update (Thrun, Burgard, Fox — "Probabilistic Robotics").
+//
+// Key improvement over CoreSLAM: distance-weighted updates prevent
+// far-away observations from corrupting close-range wall measurements.
 
 import Foundation
-import Accelerate
 
 // MARK: - SLAMEngine
 
-/// Real-time 2D SLAM engine using RMHC (Random-Mutation Hill-Climbing) search.
+/// Real-time 2D SLAM engine for LiDAR-based mapping and localization.
 ///
-/// Converts LiDAR scans into a corrected robot position and occupancy map.
+/// Uses RMHC position search (scan-to-map matching) and log-odds occupancy
+/// grid with distance-weighted inverse sensor model.
+///
 /// Thread-safe — all mutable state is protected by an internal lock.
-///
-/// Usage:
-/// ```swift
-/// let slam = SLAMEngine(scanSize: 360, mapSizePixels: 800, mapSizeMeters: 20)
-/// slam.update(scanDistancesMM: distances, velocity: (dxyMM: 0, dthetaDeg: 0, dtSec: 0.2))
-/// let pos = slam.getPosition()
-/// let grid = slam.buildOccupancyGrid()
-/// ```
 public final class SLAMEngine: @unchecked Sendable {
 
-    // MARK: - Constants
+    // MARK: - Log-Odds Constants
 
-    fileprivate static let noObstacle: UInt16 = 65500
+    /// Log-odds update for occupied cells (strong positive).
+    /// p(occ) ≈ 0.7 → log-odds = ln(0.7/0.3) ≈ 0.85
+    private static let logOccBase: Float = 0.85
+
+    /// Log-odds update for free cells (moderate negative).
+    /// p(free) ≈ 0.35 → log-odds = ln(0.35/0.65) ≈ -0.62
+    private static let logFreeBase: Float = -0.62
+
+    /// Maximum absolute log-odds value. Prevents over-commitment.
+    /// ±5.0 → p ≈ 0.993 / 0.007 — very confident but not irreversible.
+    private static let logOddsClamp: Float = 5.0
+
+    /// Minimum distance weight. Even far observations contribute slightly.
+    private static let minDistanceWeight: Float = 0.05
+
+    // MARK: - Scan Matching Constants (for RMHC compatibility)
+
+    /// Value representing obstacle in scan point classification.
     fileprivate static let obstacle: UInt16 = 0
+    /// Value representing no obstacle (free/max-range).
+    fileprivate static let noObstacle: UInt16 = 65500
 
     // MARK: - Configuration
 
@@ -47,7 +61,10 @@ public final class SLAMEngine: @unchecked Sendable {
     // MARK: - State
 
     private let lock = NSLock()
-    private var mapPixels: [UInt16]
+
+    /// Log-odds occupancy map. 0 = unknown, positive = occupied, negative = free.
+    private var logOddsMap: [Float]
+
     private let scalePixelsPerMM: Double
     private var position: SLAMPosition
     private var scanForDistance: SLAMScan
@@ -57,19 +74,6 @@ public final class SLAMEngine: @unchecked Sendable {
 
     // MARK: - Init
 
-    /// Create a SLAM engine.
-    /// - Parameters:
-    ///   - scanSize: Number of rays per LiDAR scan (default 360).
-    ///   - scanRateHz: Scans per second (default 5).
-    ///   - detectionAngleDeg: Total detection angle in degrees (default 360).
-    ///   - distanceNoDetectionMM: Default distance when laser returns 0 (default 3500).
-    ///   - mapSizePixels: Square map dimension in pixels (default 800).
-    ///   - mapSizeMeters: Square map dimension in meters (default 20).
-    ///   - mapQuality: Integration speed 0–255 (default 50).
-    ///   - holeWidthMM: Obstacle width for ray extension (default 600).
-    ///   - sigmaXYMM: XY standard deviation for RMHC search (default 100).
-    ///   - sigmaThetaDeg: Theta standard deviation for RMHC search (default 20).
-    ///   - maxSearchIter: Maximum RMHC iterations (default 1000).
     public init(
         scanSize: Int = 360,
         scanRateHz: Double = 5,
@@ -97,10 +101,9 @@ public final class SLAMEngine: @unchecked Sendable {
 
         self.scalePixelsPerMM = Double(mapSizePixels) / (mapSizeMeters * 1000.0)
 
-        // Initialize map to midpoint (unknown)
+        // Initialize log-odds map to 0 (unknown)
         let npix = mapSizePixels * mapSizePixels
-        let midVal = UInt16((Int(Self.obstacle) + Int(Self.noObstacle)) / 2)
-        self.mapPixels = [UInt16](repeating: midVal, count: npix)
+        self.logOddsMap = [Float](repeating: 0, count: npix)
 
         // Position starts at center of map
         let initCoordMM = 500.0 * mapSizeMeters
@@ -113,35 +116,38 @@ public final class SLAMEngine: @unchecked Sendable {
             distanceNoDetectionMM: distanceNoDetectionMM
         )
         self.scanForMapBuild = SLAMScan(
-            span: 3, size: scanSize, rateHz: scanRateHz,
+            span: 1, size: scanSize, rateHz: scanRateHz,
             detectionAngleDeg: detectionAngleDeg,
             distanceNoDetectionMM: distanceNoDetectionMM
         )
 
-        // Ziggurat RNG seeded from current time
         let seed = UInt32(UInt64(Date().timeIntervalSince1970 * 1000) & 0xFFFF)
         self.randomizer = ZigguratRNG(seed: seed)
     }
 
     // MARK: - Public API
 
-    /// Feed a new LiDAR scan and optional odometry velocity.
+    /// Feed a new LiDAR scan and odometry delta in SLAM map frame.
+    ///
     /// - Parameters:
-    ///   - scanDistancesMM: Array of distance values in millimeters (count must equal scanSize).
-    ///   - velocity: Optional odometry change `(dxyMM, dthetaDeg, dtSec)`.
+    ///   - scanDistancesMM: LiDAR ranges in mm (0 = no detection).
+    ///   - odomDelta: Odometry displacement in SLAM map coordinates (dxMM, dyMM, dthetaDeg).
+    ///     Pass nil if no odometry available (first scan or lost).
     public func update(
         scanDistancesMM: [Int],
-        velocity: (dxyMM: Double, dthetaDeg: Double, dtSec: Double)?
+        odomDelta: (dxMM: Double, dyMM: Double, dthetaDeg: Double)?
     ) {
         lock.lock()
         defer { lock.unlock() }
 
-        let vel = velocity ?? (dxyMM: 0.0, dthetaDeg: 0.0, dtSec: 0.0)
+        let delta = odomDelta ?? (dxMM: 0.0, dyMM: 0.0, dthetaDeg: 0.0)
 
-        // Convert pose change to velocities (per second)
-        let factor = vel.dtSec > 0 ? (1.0 / vel.dtSec) : 0.0
-        let dxyMMdt = vel.dxyMM * factor
-        let dthetaDegDt = vel.dthetaDeg * factor
+        // For scan motion compensation, derive forward velocity and angular rate.
+        // dtSec=0.2 at 5Hz. Forward velocity ≈ magnitude of displacement.
+        let dtSec = 1.0 / scanRateHz
+        let dxyMM = hypot(delta.dxMM, delta.dyMM)
+        let dxyMMdt = dxyMM / dtSec
+        let dthetaDegDt = delta.dthetaDeg / dtSec
 
         // Update both scans
         scanForDistance.update(
@@ -153,39 +159,85 @@ public final class SLAMEngine: @unchecked Sendable {
             velocityDxyMM: dxyMMdt, velocityDthetaDeg: dthetaDegDt
         )
 
-        // Compute start position from odometry
-        var startPos = position
-        let thetaRad = startPos.thetaDeg * .pi / 180.0
-        startPos.xMM += vel.dxyMM * cos(thetaRad)
-        startPos.yMM += vel.dxyMM * sin(thetaRad)
-        startPos.thetaDeg += vel.dthetaDeg
+        // Predict position directly from odom dx/dy (no heading-based projection)
+        var odomPos = position
+        odomPos.xMM += delta.dxMM
+        odomPos.yMM += delta.dyMM
+        odomPos.thetaDeg += delta.dthetaDeg
 
         // RMHC search for best position
-        let newPos = rmhcPositionSearch(startPos: startPos)
+        let rmhcPos = rmhcPositionSearch(startPos: odomPos)
 
-        // Update position
-        position = newPos
+        // Match quality gate: if RMHC result is poor, trust odometry instead.
+        // This prevents the robot from "jumping behind walls" when scan matching fails.
+        let odomDist = distanceScanToMap(scan: scanForDistance, position: odomPos)
+        let rmhcDist = distanceScanToMap(scan: scanForDistance, position: rmhcPos)
 
-        // Update map with the map-build scan
-        mapUpdate(scan: &scanForMapBuild, position: newPos)
+        let newPos: SLAMPosition
+        let usedOdomFallback: Bool
+        if rmhcDist >= 0 && (odomDist < 0 || rmhcDist <= odomDist) {
+            newPos = rmhcPos
+            usedOdomFallback = false
+        } else {
+            newPos = odomPos
+            usedOdomFallback = true
+        }
+        // Clamp position to map bounds (prevent off-map drift)
+        let margin = 20.0  // mm from edge
+        let mapExtentMM = mapSizeMeters * 1000.0
+        var clampedPos = newPos
+        clampedPos.xMM = max(margin, min(mapExtentMM - margin, clampedPos.xMM))
+        clampedPos.yMM = max(margin, min(mapExtentMM - margin, clampedPos.yMM))
+        position = clampedPos
+
+        // Count obstacle points in current scan
+        let obstacleCount = scanForDistance.points.prefix(scanForDistance.npoints)
+            .filter { $0.value == Self.obstacle }.count
+        let maxRangeCount = scanForDistance.points.prefix(scanForDistance.npoints)
+            .filter { $0.value == Self.noObstacle }.count
+
+        // Detailed logging every 10 scans
+        if updateCount % 10 == 0 {
+            let posPx = (Int(newPos.xMM * scalePixelsPerMM), Int(newPos.yMM * scalePixelsPerMM))
+            let fb = usedOdomFallback ? " FALLBACK" : ""
+            print(String(format: "[SLAM #%d] pos=(%.0f,%.0f) px=(%d,%d) θ=%.1f° pts=%d/%d rmhc=%d odom=%d%@",
+                         updateCount,
+                         newPos.xMM, newPos.yMM, posPx.0, posPx.1,
+                         newPos.thetaDeg,
+                         obstacleCount, obstacleCount + maxRangeCount,
+                         rmhcDist, odomDist, fb))
+        }
+
+        // Update map with log-odds
+        mapUpdateLogOdds(scan: &scanForMapBuild, position: newPos)
 
         updateCount += 1
     }
 
+    /// Set the initial heading before the first update.
+    public func setInitialHeading(thetaDeg: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        position.thetaDeg = thetaDeg
+    }
+
     /// Get the current corrected position.
-    /// - Returns: Tuple `(xMM, yMM, thetaDeg)` in map coordinates.
     public func getPosition() -> (xMM: Double, yMM: Double, thetaDeg: Double) {
         lock.lock()
         defer { lock.unlock() }
         return (position.xMM, position.yMM, position.thetaDeg)
     }
 
-    /// Get the current map as bytes.
-    /// - Returns: Array of `UInt8` where 0=obstacle, ~127=unknown, ~255=free.
+    /// Get the current map as bytes (0=obstacle, ~127=unknown, ~255=free).
     public func getMap() -> [UInt8] {
         lock.lock()
         defer { lock.unlock() }
-        return mapPixels.map { UInt8($0 >> 8) }
+        return logOddsMap.map { logOdds in
+            // Convert log-odds [-5..+5] → byte [255..0]
+            // Positive (occupied) → low value (dark), negative (free) → high value (bright)
+            let normalized = (-logOdds / Self.logOddsClamp + 1.0) * 0.5  // [0..1]
+            return UInt8(max(0, min(255, Int(normalized * 255))))
+        }
     }
 
     /// Build an `OccupancyGrid` from the current SLAM state for rendering.
@@ -196,11 +248,73 @@ public final class SLAMEngine: @unchecked Sendable {
         let resolutionMeters = Float(mapSizeMeters) / Float(mapSizePixels)
         let originM = -mapSizeMeters / 2.0
 
-        let data: [Int8] = mapPixels.map { pixel in
-            let byte = pixel >> 8
-            if byte < 80 { return 100 }    // occupied
-            if byte > 180 { return 0 }     // free
-            return -1                       // unknown
+        var wallCount = 0
+        var protectedCount = 0
+        var freeCount = 0
+        var maxLogOdds: Float = -999
+        var minLogOdds: Float = 999
+
+        // Build data: only flip Y (SLAM Y-down → ROS Y-up). X stays same direction.
+        let sz = mapSizePixels
+        var data = [Int8](repeating: -1, count: sz * sz)
+        for y in 0 ..< sz {
+            let flippedY = sz - 1 - y  // flip Y only
+            for x in 0 ..< sz {
+                let logOdds = logOddsMap[y * sz + x]
+                
+                if logOdds > maxLogOdds { maxLogOdds = logOdds }
+                if logOdds < minLogOdds { minLogOdds = logOdds }
+                
+                let val: Int8
+                if logOdds > 0.5 {
+                    wallCount += 1
+                    if logOdds > 2.0 { protectedCount += 1 }
+                    val = 100
+                } else if logOdds < -0.5 {
+                    freeCount += 1
+                    val = 0
+                } else {
+                    val = -1
+                }
+                data[flippedY * sz + x] = val  // x unchanged
+            }
+        }
+
+        if updateCount % 50 == 0 {
+            print(String(format: "[MAP] walls=%d (protected=%d) free=%d logOdds=[%.1f, %.1f] updates=%d",
+                         wallCount, protectedCount, freeCount, minLogOdds, maxLogOdds, updateCount))
+
+            // Check map corners (SLAM pixel coords) for wall data
+            // Map is 800px = 12m. Room corners at ±2.5m from center.
+            // Center = pixel 400. ±2.5m = ±167px. So corners at ~233,233 / 567,233 / 233,567 / 567,567
+            let cornerZones = [
+                ("TL(x-,y-)", 233, 233),  // SLAM top-left = world (x-, y+)
+                ("TR(x+,y-)", 567, 233),  // SLAM top-right = world (x+, y+)
+                ("BL(x-,y+)", 233, 567),  // SLAM bottom-left = world (x-, y-)
+                ("BR(x+,y+)", 567, 567),  // SLAM bottom-right = world (x+, y-)
+            ]
+            var cornerInfo: [String] = []
+            for (name, cx, cy) in cornerZones {
+                // Check 20x20 pixel area around corner
+                var wallPx = 0, freePx = 0, unkPx = 0
+                var maxLO: Float = -10, minLO: Float = 10
+                for dy in -10...10 {
+                    for dx in -10...10 {
+                        let px = cx + dx, py = cy + dy
+                        if px >= 0, px < sz, py >= 0, py < sz {
+                            let lo = logOddsMap[py * sz + px]
+                            if lo > maxLO { maxLO = lo }
+                            if lo < minLO { minLO = lo }
+                            if lo > 0.5 { wallPx += 1 }
+                            else if lo < -0.5 { freePx += 1 }
+                            else { unkPx += 1 }
+                        }
+                    }
+                }
+                cornerInfo.append(String(format: "%@:w%d/f%d/u%d[%.1f,%.1f]",
+                                         name, wallPx, freePx, unkPx, minLO, maxLO))
+            }
+            print("[MAP corners] \(cornerInfo.joined(separator: "  "))")
         }
 
         return OccupancyGrid(
@@ -221,8 +335,7 @@ public final class SLAMEngine: @unchecked Sendable {
         defer { lock.unlock() }
 
         let npix = mapSizePixels * mapSizePixels
-        let midVal = UInt16((Int(Self.obstacle) + Int(Self.noObstacle)) / 2)
-        mapPixels = [UInt16](repeating: midVal, count: npix)
+        logOddsMap = [Float](repeating: 0, count: npix)
 
         let initCoordMM = 500.0 * mapSizeMeters
         position = SLAMPosition(xMM: initCoordMM, yMM: initCoordMM, thetaDeg: 0)
@@ -233,7 +346,7 @@ public final class SLAMEngine: @unchecked Sendable {
             distanceNoDetectionMM: distanceNoDetectionMM
         )
         scanForMapBuild = SLAMScan(
-            span: 3, size: scanSize, rateHz: scanRateHz,
+            span: 1, size: scanSize, rateHz: scanRateHz,
             detectionAngleDeg: detectionAngleDeg,
             distanceNoDetectionMM: distanceNoDetectionMM
         )
@@ -256,7 +369,8 @@ private struct SLAMPosition {
 private struct SLAMScanPoint {
     var xMM: Double
     var yMM: Double
-    var value: UInt16  // OBSTACLE or NO_OBSTACLE
+    var value: UInt16
+    var distanceMM: Double  // distance from robot to this point
 }
 
 private struct SLAMScan {
@@ -276,11 +390,8 @@ private struct SLAMScan {
         self.rateHz = rateHz
         self.detectionAngleDeg = detectionAngleDeg
         self.distanceNoDetectionMM = distanceNoDetectionMM
-        self.points = []
-        self.npoints = 0
     }
 
-    /// Update scan from raw LiDAR distances with velocity correction.
     mutating func update(
         distances: [Int],
         holeWidthMM: Double,
@@ -301,7 +412,6 @@ private struct SLAMScan {
             let lidarValue = i < distances.count ? distances[i] : 0
 
             if lidarValue == 0 {
-                // No obstacle detected — use max range
                 appendXY(
                     offset: i, distance: distanceNoDetectionMM,
                     scanVal: SLAMEngine.noObstacle,
@@ -309,7 +419,6 @@ private struct SLAMScan {
                     angleRange: angleRange, totalSpanPoints: totalSpanPoints
                 )
             } else if Double(lidarValue) > holeWidthMM / 2.0 {
-                // Valid obstacle
                 appendXY(
                     offset: i, distance: lidarValue,
                     scanVal: SLAMEngine.obstacle,
@@ -318,7 +427,6 @@ private struct SLAMScan {
                 )
             }
         }
-
         npoints = points.count
     }
 
@@ -332,16 +440,16 @@ private struct SLAMScan {
             let angle = (-angleRange / 2.0 + k * rotation) * .pi / 180.0
             let dist = Double(distance)
             let x = dist * cos(angle) - k * horzMM
-            let y = dist * sin(angle)
-            points.append(SLAMScanPoint(xMM: x, yMM: y, value: scanVal))
+            // Negate Y: scan uses math convention (Y-up) but SLAM map is Y-down.
+            // Without negation, "left" in robot frame maps to SLAM Y+ (down) = world Y-.
+            let y = -dist * sin(angle)
+            points.append(SLAMScanPoint(xMM: x, yMM: y, value: scanVal, distanceMM: dist))
         }
     }
 }
 
 // MARK: - Ziggurat RNG
 
-/// Fast Gaussian random number generator using the Ziggurat method.
-/// Ported from Marsaglia & Tsang's ziggurat algorithm.
 private struct ZigguratRNG {
     private var seed: UInt32
     private var kn: [UInt32]
@@ -382,7 +490,6 @@ private struct ZigguratRNG {
         }
     }
 
-    /// SHR3 shift-register generator.
     private mutating func shr3() -> UInt32 {
         let value = seed
         seed = seed ^ (seed << 13)
@@ -391,7 +498,6 @@ private struct ZigguratRNG {
         return value &+ seed
     }
 
-    /// Uniform [0,1) float.
     private mutating func uniform() -> Float {
         let jsrInput = seed
         seed = seed ^ (seed << 13)
@@ -401,10 +507,8 @@ private struct ZigguratRNG {
         return fmodf(0.5 + Float(combined) / 65536.0 / 65536.0, 1.0)
     }
 
-    /// Standard normal variate (mean 0, variance 1).
     mutating func normal() -> Float {
         let r: Float = 3.442620
-
         let hz = Int32(bitPattern: shr3())
         let iz = Int(UInt32(bitPattern: hz) & 127)
 
@@ -423,7 +527,6 @@ private struct ZigguratRNG {
                     x = -0.2904764 * logf(uniform())
                     y = -logf(uniform())
                 } while x * x > y + y
-
                 return currentHz <= 0 ? -r - x : r + x
             }
 
@@ -442,7 +545,6 @@ private struct ZigguratRNG {
         }
     }
 
-    /// Normal variate with given mean and standard deviation.
     mutating func normal(mu: Double, sigma: Double) -> Double {
         return mu + sigma * Double(normal())
     }
@@ -452,10 +554,10 @@ private struct ZigguratRNG {
 
 private extension SLAMEngine {
 
-    // MARK: distance_scan_to_map
+    // MARK: - Scan-to-Map Distance (for RMHC position search)
 
     /// Score how well a scan matches the map at a given position.
-    /// Returns sum of map values at scan obstacle points (scaled), or -1 if no points match.
+    /// Returns a distance metric (lower = better match). -1 if no points match.
     func distanceScanToMap(scan: SLAMScan, position: SLAMPosition) -> Int {
         let thetaRad = position.thetaDeg * .pi / 180.0
         let cosTheta = cos(thetaRad) * scalePixelsPerMM
@@ -474,7 +576,11 @@ private extension SLAMEngine {
             let y = Int(floor(posYPix + sinTheta * pt.xMM + cosTheta * pt.yMM + 0.5))
 
             if x >= 0, x < mapSizePixels, y >= 0, y < mapSizePixels {
-                sum += Int64(mapPixels[y * mapSizePixels + x])
+                // Convert log-odds to pixel-equivalent for matching:
+                // occupied (+5) → low value (good match), free (-5) → high value (bad match)
+                let logOdds = logOddsMap[y * mapSizePixels + x]
+                let pixelEquiv = Int(32768.0 - Double(logOdds) * 6000.0)
+                sum += Int64(max(0, min(65535, pixelEquiv)))
                 npoints += 1
             }
         }
@@ -482,135 +588,124 @@ private extension SLAMEngine {
         return npoints > 0 ? Int(sum * 1024 / Int64(npoints)) : -1
     }
 
-    // MARK: map_update
+    // MARK: - Log-Odds Map Update
 
-    /// Update the map by ray-tracing from robot to each scan point.
-    func mapUpdate(scan: inout SLAMScan, position: SLAMPosition) {
+    /// Update map using log-odds with distance-weighted inverse sensor model.
+    ///
+    /// For each scan ray:
+    /// - Cells along the ray before the hit → free update (weighted by distance)
+    /// - Cell at the hit point → occupied update (weighted by distance)
+    /// - Cells beyond the hit point → not updated (no information)
+    ///
+    /// Close-range observations get high weight, far observations get low weight.
+    /// Log-odds are clamped so confident measurements can't be easily overwritten.
+    func mapUpdateLogOdds(scan: inout SLAMScan, position: SLAMPosition) {
         let thetaRad = position.thetaDeg * .pi / 180.0
         let cosTheta = cos(thetaRad)
         let sinTheta = sin(thetaRad)
 
-        let x1 = Self.roundup(position.xMM * scalePixelsPerMM)
-        let y1 = Self.roundup(position.yMM * scalePixelsPerMM)
+        let robotPixX = Int(position.xMM * scalePixelsPerMM + 0.5)
+        let robotPixY = Int(position.yMM * scalePixelsPerMM + 0.5)
+
+        guard robotPixX >= 0, robotPixX < mapSizePixels,
+              robotPixY >= 0, robotPixY < mapSizePixels else { return }
+
+        let maxRangeMM = Double(distanceNoDetectionMM)
 
         for i in 0 ..< scan.npoints {
             let pt = scan.points[i]
-            var x2p = cosTheta * pt.xMM - sinTheta * pt.yMM
-            var y2p = sinTheta * pt.xMM + cosTheta * pt.yMM
+            let isObstacle = pt.value == Self.obstacle
 
-            let xp = Self.roundup((position.xMM + x2p) * scalePixelsPerMM)
-            let yp = Self.roundup((position.yMM + y2p) * scalePixelsPerMM)
+            // Scan point in world frame
+            let wx = cosTheta * pt.xMM - sinTheta * pt.yMM
+            let wy = sinTheta * pt.xMM + cosTheta * pt.yMM
 
-            let dist = sqrt(x2p * x2p + y2p * y2p)
-            guard dist > 0 else { continue }
-            let add = holeWidthMM / 2.0 / dist
+            // Distance-based weight: quadratic falloff
+            // Close range → weight ≈ 1.0, far range → weight → minWeight
+            let distRatio = Float(pt.distanceMM / maxRangeMM)
+            let weight = max(Self.minDistanceWeight, 1.0 - distRatio * distRatio)
 
-            x2p *= scalePixelsPerMM * (1.0 + add)
-            y2p *= scalePixelsPerMM * (1.0 + add)
+            // Endpoint in pixel coordinates
+            let endPixX = Int((position.xMM + wx) * scalePixelsPerMM + 0.5)
+            let endPixY = Int((position.yMM + wy) * scalePixelsPerMM + 0.5)
 
-            let x2 = Self.roundup(position.xMM * scalePixelsPerMM + x2p)
-            let y2 = Self.roundup(position.yMM * scalePixelsPerMM + y2p)
-
-            var value = Int(Self.obstacle)
-            var q = mapQuality
-
-            if pt.value == Self.noObstacle {
-                q = mapQuality / 4
-                value = Int(Self.noObstacle)
-            }
-
-            mapLaserRay(x1: x1, y1: y1, x2: x2, y2: y2, xp: xp, yp: yp, value: value, alpha: q)
+            // Bresenham ray-cast with log-odds update
+            bresenhamLogOdds(
+                x0: robotPixX, y0: robotPixY,
+                x1: endPixX, y1: endPixY,
+                isObstacle: isObstacle,
+                weight: weight
+            )
         }
     }
 
-    // MARK: map_laser_ray (Bresenham)
+    /// Bresenham ray-cast that updates log-odds along the ray.
+    ///
+    /// Key protection: cells already confidently marked as occupied (logOdds > wallProtection)
+    /// are NOT degraded by free-ray updates. This prevents far-away observations from
+    /// erasing walls that were accurately mapped at close range.
+    func bresenhamLogOdds(
+        x0: Int, y0: Int, x1: Int, y1: Int,
+        isObstacle: Bool, weight: Float
+    ) {
+        let freeUpdate = Self.logFreeBase * weight
+        let occUpdate = Self.logOccBase * weight
+        let clampHi = Self.logOddsClamp
+        let clampLo = -Self.logOddsClamp
+        let sz = mapSizePixels
 
-    /// Bresenham ray-cast from (x1,y1) to (x2,y2) through obstacle point (xp,yp).
-    /// Updates map pixels with blended values.
-    func mapLaserRay(x1: Int, y1: Int, x2: Int, y2: Int, xp: Int, yp: Int, value: Int, alpha: Int) {
-        guard !outOfBounds(x1, mapSizePixels), !outOfBounds(y1, mapSizePixels) else { return }
+        // Confident wall threshold: don't apply free updates to cells above this.
+        // logOccBase=0.85, so 3 close hits → 2.55, protected after ~3 scans.
+        // This prevents heading-drift free rays from erasing walls.
+        let wallProtection: Float = 2.0
 
-        var x2c = x2
-        var y2c = y2
+        var x = x0, y = y0
+        let dx = abs(x1 - x0), dy = abs(y1 - y0)
+        let sx = x0 < x1 ? 1 : -1
+        let sy = y0 < y1 ? 1 : -1
+        var err = dx - dy
 
-        // Clip the endpoint to map bounds
-        if Self.clip(&x2c, &y2c, x1, y1, mapSizePixels)
-            || Self.clip(&y2c, &x2c, y1, x1, mapSizePixels) {
-            return
-        }
+        let totalSteps = max(dx, dy)
+        // Mark a small zone at the endpoint as occupied.
+        // 1px leaves gaps between rays at medium range; 2px fills them.
+        let obstThickness = 2
+        var step = 0
 
-        var dx = abs(x2 - x1)
-        var dy = abs(y2 - y1)
-        var dxc = abs(x2c - x1)
-        var dyc = abs(y2c - y1)
-        var incptrx = (x2 > x1) ? 1 : -1
-        var incptry = (y2 > y1) ? mapSizePixels : -mapSizePixels
-        let sincv = value > Int(Self.noObstacle) ? 1 : -1
+        while true {
+            if x >= 0, x < sz, y >= 0, y < sz {
+                let idx = y * sz + x
+                let atEndpoint = (x == x1 && y == y1)
+                let nearEndpoint = (totalSteps - step) <= obstThickness
 
-        var derrorv: Int
-        if dx > dy {
-            derrorv = abs(xp - x2)
-        } else {
-            Swift.swap(&dx, &dy)
-            Swift.swap(&dxc, &dyc)
-            Swift.swap(&incptrx, &incptry)
-            derrorv = abs(yp - y2)
-        }
-
-        guard derrorv != 0 else { return }
-
-        var error = 2 * dyc - dxc
-        let horiz = 2 * dyc
-        let diago = 2 * (dyc - dxc)
-        var errorv = derrorv / 2
-
-        let incv = (value - Int(Self.noObstacle)) / derrorv
-        let incerrorv = value - Int(Self.noObstacle) - derrorv * incv
-
-        var ptrIdx = y1 * mapSizePixels + x1
-        var pixval = Int(Self.noObstacle)
-
-        let alpha256 = 256 - alpha
-
-        for x in 0 ... dxc {
-            if x > dx - 2 * derrorv {
-                if x <= dx - derrorv {
-                    pixval += incv
-                    errorv += incerrorv
-                    if errorv > derrorv {
-                        pixval += sincv
-                        errorv -= derrorv
+                if atEndpoint || nearEndpoint {
+                    if isObstacle {
+                        // Occupied update — always apply (wall confirmation)
+                        logOddsMap[idx] = min(clampHi, logOddsMap[idx] + occUpdate)
+                    } else {
+                        // Max-range free ray endpoint
+                        if logOddsMap[idx] < wallProtection {
+                            logOddsMap[idx] = max(clampLo, logOddsMap[idx] + freeUpdate)
+                        }
                     }
                 } else {
-                    pixval -= incv
-                    errorv -= incerrorv
-                    if errorv < 0 {
-                        pixval -= sincv
-                        errorv += derrorv
+                    // Free space update — but protect confident walls
+                    if logOddsMap[idx] < wallProtection {
+                        logOddsMap[idx] = max(clampLo, logOddsMap[idx] + freeUpdate)
                     }
                 }
             }
 
-            // Blend into map
-            if ptrIdx >= 0, ptrIdx < mapPixels.count {
-                mapPixels[ptrIdx] = UInt16(
-                    (alpha256 * Int(mapPixels[ptrIdx]) + alpha * pixval) >> 8
-                )
-            }
+            if x == x1 && y == y1 { break }
 
-            if error > 0 {
-                ptrIdx += incptry
-                error += diago
-            } else {
-                error += horiz
-            }
-            ptrIdx += incptrx
+            let e2 = 2 * err
+            if e2 > -dy { err -= dy; x += sx }
+            if e2 < dx { err += dx; y += sy }
+            step += 1
         }
     }
 
-    // MARK: rmhc_position_search
+    // MARK: - RMHC Position Search
 
-    /// Random-Mutation Hill-Climbing search for the best position.
     func rmhcPositionSearch(startPos: SLAMPosition) -> SLAMPosition {
         var bestPos = startPos
         var lastBestPos = startPos
@@ -651,30 +746,5 @@ private extension SLAMEngine {
         }
 
         return bestPos
-    }
-
-    // MARK: Helpers
-
-    static func roundup(_ x: Double) -> Int {
-        Int(floor(x + 0.5))
-    }
-
-    func outOfBounds(_ value: Int, _ bound: Int) -> Bool {
-        value < 0 || value >= bound
-    }
-
-    /// Clip a line endpoint to [0, mapSize). Returns true if the line is entirely outside.
-    static func clip(_ xyc: inout Int, _ yxc: inout Int, _ xy: Int, _ yx: Int, _ mapSize: Int) -> Bool {
-        if xyc < 0 {
-            if xyc == xy { return true }
-            yxc += (yxc - yx) * (-xyc) / (xyc - xy)
-            xyc = 0
-        }
-        if xyc >= mapSize {
-            if xyc == xy { return true }
-            yxc += (yxc - yx) * (mapSize - 1 - xyc) / (xyc - xy)
-            xyc = mapSize - 1
-        }
-        return false
     }
 }
