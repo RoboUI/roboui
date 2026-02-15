@@ -393,10 +393,14 @@ public final class RosbridgeConnection: ObservableObject {
             return
         }
         
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return
+        }
         
-        if let topic = json["topic"] as? String, let handler = messageHandlers[topic] {
-            handler(data)
+        if let topic = json["topic"] as? String {
+            if let handler = messageHandlers[topic] {
+                handler(data)
+            }
         } else if let op = json["op"] as? String, op == "service_response",
                   let id = json["id"] as? String, let handler = messageHandlers["service:\(id)"] {
             handler(data)
