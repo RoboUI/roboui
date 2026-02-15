@@ -79,10 +79,12 @@ public struct TelemetryView: View {
             Text(item.value)
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(.primary)
+                .fixedSize()
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 6))
+        .fixedSize()
     }
     
     // MARK: - Grid (cards)

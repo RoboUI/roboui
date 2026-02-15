@@ -72,7 +72,7 @@ public final class RosbridgeConnection: ObservableObject {
     /// Reconnect configuration. Change before calling `connect()`.
     public var reconnectConfig: ReconnectConfig
     
-    private let url: URL
+    private var url: URL
     private var webSocket: URLSessionWebSocketTask?
     private var session: URLSession?
     private var messageHandlers: [String: (Data) -> Void] = [:]
@@ -101,6 +101,17 @@ public final class RosbridgeConnection: ObservableObject {
         performConnect()
     }
     
+    /// Connect to a new URL. Disconnects from current if connected.
+    public func connect(to newURL: String) {
+        guard let parsed = URL(string: newURL) else {
+            state = .error("Invalid URL: \(newURL)")
+            return
+        }
+        disconnect()
+        url = parsed
+        connect()
+    }
+    
     public func disconnect() {
         intentionalDisconnect = true
         cancelReconnect()
@@ -110,7 +121,7 @@ public final class RosbridgeConnection: ObservableObject {
     
     // MARK: - Publishing
     
-    public func advertise(topic: String, type: String) {
+    public func advertise(topic: String, type: String, latch: Bool = false) {
         // Track for re-advertise on reconnect
         if !pendingAdvertisements.contains(where: { $0.topic == topic }) {
             pendingAdvertisements.append((topic: topic, type: type))
@@ -119,7 +130,8 @@ public final class RosbridgeConnection: ObservableObject {
         let msg: [String: Any] = [
             "op": "advertise",
             "topic": topic,
-            "type": type
+            "type": type,
+            "latch": latch  // false = VOLATILE QoS (compatible with most ROS2 subscribers)
         ]
         send(msg)
     }
